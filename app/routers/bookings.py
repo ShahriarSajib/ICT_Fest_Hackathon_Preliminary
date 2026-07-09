@@ -104,6 +104,7 @@ def create_booking(
         db.commit()
         db.refresh(booking)
 
+    stats.get(room.id, db)  # warm cache from DB if needed
     stats.record_create(room.id, price_cents)
     cache.invalidate_availability(room.id, start.date().isoformat())
     cache.invalidate_report(user.org_id)
@@ -199,6 +200,7 @@ def cancel_booking(
     booking.status = "cancelled"
     db.commit()
 
+    stats.get(booking.room_id, db)  # warm cache from DB if needed
     stats.record_cancel(booking.room_id, booking.price_cents)
     cache.invalidate_report(user.org_id)
     notifications.notify_cancelled(booking)
