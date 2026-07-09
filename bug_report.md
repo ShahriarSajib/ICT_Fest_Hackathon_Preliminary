@@ -31,6 +31,7 @@ violates the business rules / API contract, and describes the exact fix applied.
 22. [Usage Report Cache Not Invalidated on Booking Creation](#22-usage-report-cache-not-invalidated-on-booking-creation)
 23. [Export `fetch_bookings_raw` Missing Org Filter](#23-export-fetch_bookings_raw-missing-org-filter)
 24. [Stats Cache Returns 0 on Cold Start](#24-stats-cache-returns-0-on-cold-start)
+25. [Get Booking Missing Ownership Check](#25-get-bookingsid-missing-ownership-check)
 
 ---
 
@@ -594,3 +595,33 @@ Updated all call sites to pass `db`:
 - `app/routers/rooms.py:110` — `stats.get(room.id, db)`
 - `app/routers/bookings.py:107` — `stats.get(room.id, db)` before `record_create`
 - `app/routers/bookings.py:202` — `stats.get(booking.room_id, db)` before `record_cancel`
+
+---
+
+## 25. `GET /bookings/{id}` Missing Ownership Check
+
+**File:** `app/routers/bookings.py:151`
+**Rule:** API Contract / Multi-tenancy
+
+### Bug
+```python
+if booking is None:
+    raise AppError(404, "BOOKING_NOT_FOUND", "Booking not found")
+
+response = serialize_booking(booking)   # ← returned to ANY org member
+```
+`get_booking` filtered only by `Room.org_id == user.org_id`, so any member of an
+organisation could fetch any other member's booking by ID. This contradicted:
+- `list_bookings` — which only returns the requesting user's own bookings
+- `cancel_booking` — which already enforced ownership with the same check below
+
+### Fix
+```python
+if booking is None:
+    raise AppError(404, "BOOKING_NOT_FOUND", "Booking not found")
+if user.role != "admin" and booking.user_id != user.id:
+    raise AppError(404, "BOOKING_NOT_FOUND", "Booking not found")
+```
+Non-admin users now receive `404 BOOKING_NOT_FOUND` when requesting a booking
+they do not own, while admins retain full read access to all bookings in their org.
+
