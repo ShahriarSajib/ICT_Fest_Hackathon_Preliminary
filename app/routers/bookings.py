@@ -120,7 +120,10 @@ def list_bookings(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    base = db.query(Booking).filter(Booking.user_id == user.id)
+    if user.role == "admin":
+        base = db.query(Booking).join(Room).filter(Room.org_id == user.org_id)
+    else:
+        base = db.query(Booking).filter(Booking.user_id == user.id)
     total = base.count()
     items = (
         base.order_by(Booking.start_time.asc(), Booking.id.asc())

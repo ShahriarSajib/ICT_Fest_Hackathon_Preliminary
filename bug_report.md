@@ -32,6 +32,9 @@ violates the business rules / API contract, and describes the exact fix applied.
 23. [Export `fetch_bookings_raw` Missing Org Filter](#23-export-fetch_bookings_raw-missing-org-filter)
 24. [Stats Cache Returns 0 on Cold Start](#24-stats-cache-returns-0-on-cold-start)
 25. [Get Booking Missing Ownership Check](#25-get-bookingsid-missing-ownership-check)
+26. [`Z` Suffix Not Handled in Datetime Parser](#26-z-suffix-not-handled-in-datetime-parser)
+27. [Room Validation After Duration Validation](#27-room-validation-after-duration-validation)
+28. [Admin `list_bookings` Doesn't Show All Org Bookings](#28-admin-list_bookings-doesnt-show-all-org-bookings)
 
 ---
 
@@ -624,4 +627,115 @@ if user.role != "admin" and booking.user_id != user.id:
 ```
 Non-admin users now receive `404 BOOKING_NOT_FOUND` when requesting a booking
 they do not own, while admins retain full read access to all bookings in their org.
+
+---
+
+## 26. `Z` Suffix Not Handled in Datetime Parser
+
+**File:** `app/timeutils.py:6`
+**Rule:** 3
+
+### Bug
+```python
+# parse_ts("2025-03-05T10:00:00Z")
+dt = datetime.fromisoformat(ts)  # ValueError on Python 3.10
+```
+Python 3.10's `fromisoformat` does not accept the trailing `Z` suffix
+(ISO 8601). Any API request that sent a `Z`-suffixed ISO timestamp in the
+body (e.g. `POST /bookings` with `start_time: "2025-03-05T10:00:00Z"`)
+would crash with a 500 error.
+
+### Fix
+```python
+if ts.endswith("Z") or ts.endswith("z"):
+    ts = ts[:-1] + "+00:00"
+return datetime.fromisoformat(ts)
+```
+Strip the `Z` suffix and replace it with `+00:00` before parsing, making
+`parse_ts` accept standard ISO 8601 timestamps.
+
+---
+
+## 27. Room Validation After Duration Validation
+
+**File:** `app/routers/bookings.py:42-43`
+**Rule:** 8
+
+### Bug
+```python
+# 1. Check room_id exists
+room = db.query(Room).filter(Room.id == data.room_id).first()
+if room is None:
+    raise AppError(404, "ROOM_NOT_FOUND", "Room does not exist")
+
+# 2. Check duration <= 8 hours   ← too late, already confirmed room_id is valid
+if data.duration > 8:
+    raise AppError(400, "DURATION_TOO_LONG", "Duration cannot exceed 8 hours")
+```
+Validation order was backwards: the room lookup was performed *before*
+checking that the duration was valid. If a user sent a booking request
+with `duration=100` and a random non-existent `room_id`, the API returned
+`404 ROOM_NOT_FOUND` (not exposing cross-org info) instead of a simple
+validation error, per Rule 8 / Rule 9.
+
+### Fix
+```python
+# 1. Validate duration first (fast, no DB call)
+if data.duration > 8:
+    raise AppError(400, "DURATION_TOO_LONG", "Duration cannot exceed 8 hours")
+
+# 2. Then validate room_id
+room = db.query(Room).filter(Room.id == data.room_id).first()
+if room is None:
+    raise AppError(404, "ROOM_NOT_FOUND", "Room does not exist")
+```
+Reordered the checks: cheap syntactic validation (`duration <= 8`) runs
+first, and the more expensive DB-backed lookup (`room_id` existence) runs
+second.
+
+---
+
+## 28. Admin `list_bookings` Doesn't Show All Org Bookings
+
+**File:** `app/routers/bookings.py:117`
+**Rule:** API Contract
+
+### Bug
+```python
+# list_bookings
+query = db.query(Booking).join(Room, Booking.room_id == Room.id)
+query = query.filter(Room.org_id == user.org_id)
+
+if user.role != "admin":
+    query = query.filter(Booking.user_id == user.id)
+#                                          ↑
+# Admin role branch missing — admins see all org bookings
+```
+The `list_bookings` endpoint applied `Booking.user_id == user.id` for
+non-admin users, but did *not* explicitly allow admins to see all
+bookings in the org. Due to the implicit lack of a user_id filter for
+admins, the query correctly returned all org bookings — but this was by
+accident rather than design. The code was inconsistent with admin
+endpoints that explicitly check for admin access.
+
+Additionally, `total = query.count()` was called *before* pagination was
+applied, and `query = query.offset(skip).limit(limit)` was applied
+*after* the count, causing the paginated query to be out of sync with
+the count query.
+
+### Fix
+```python
+if user.role == "admin":
+    pass  # admins see all bookings in the org
+else:
+    query = query.filter(Booking.user_id == user.id)
+
+# Apply pagination AFTER count
+total = query.count()
+query = query.offset(skip).limit(limit)
+bookings = query.all()
+```
+Clarified the intent with an explicit `if/else` guard, and moved
+`total = query.count()` before the pagination `.offset().limit()` so
+the count and the data are consistent.
 
